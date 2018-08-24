@@ -83,7 +83,7 @@ class Watcher:
         		}},
                         {{
             			"name": "Version",
-            			"value": "1.7.3"
+            			"value": "1.7.7"
         		}},
                         {{
             			"name": "Operation",
