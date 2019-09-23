@@ -18,6 +18,7 @@
 
 import os
 import os.path
+import signal
 import pwd
 import grp
 import re
@@ -45,7 +46,7 @@ except Exception as e:
 
 # Global Variables
 PackagesDirectory = 'packages'
-BundleFileName = 'omsagent-1.11.0-8.universal.x64.sh'
+BundleFileName = 'omsagent-1.11.0-9.universal.x64.sh'
 GUIDRegex = r'[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}'
 GUIDOnlyRegex = r'^' + GUIDRegex + '$'
 SCOMCertIssuerRegex = r'^[\s]*Issuer:[\s]*CN=SCX-Certificate/title=SCX' + GUIDRegex + ', DC=.*$'
@@ -160,6 +161,27 @@ def main():
     exit_code = 0
     message = '{0} succeeded'.format(operation)
 
+    # Clean status file to mitigate diskspace issues on small VMs
+    status_files = [
+            "/var/opt/microsoft/omsconfig/status/dscperformconsistency",
+            "/var/opt/microsoft/omsconfig/status/dscperforminventory",
+            "/var/opt/microsoft/omsconfig/status/dscsetlcm",
+            "/var/opt/microsoft/omsconfig/status/omsconfighost"
+        ]
+    for sf in status_files:
+        if os.path.isfile(sf):
+            if sf.startswith("/var/opt/microsoft/omsconfig/status"):
+                try:
+                    os.remove(sf)
+                except Exception as e:
+                    hutil_log_info('Error removing telemetry status file before installation: {0}'.format(sf))
+                    hutil_log_info('Exception info: {0}'.format(traceback.format_exc()))
+
+    exit_code = check_disk_space_availability()
+    if exit_code is not 0:
+        message = '{0} failed due to low disk space'.format(operation)
+        log_and_exit(operation, exit_code, message)   
+
     # Invoke operation
     try:
         global HUtilObject
@@ -200,7 +222,28 @@ def main():
     # Finish up and log messages
     log_and_exit(operation, exit_code, message)   
         
+def check_disk_space_availability():
+    """
+    Check if there is the required space on the machine.
+    """
+    try:
+        if get_free_space_mb("/var") < 500 or get_free_space_mb("/etc") < 500 or get_free_space_mb("/opt") < 500:
+            # 52 is the exit code for missing dependency i.e. disk space
+            # https://github.com/Azure/azure-marketplace/wiki/Extension-Build-Notes-Best-Practices#error-codes-and-messages-output-to-stderr
+            return 52
+        else:
+            return 0
+    except:
+        print('Failed to check disk usage.')
+        return 0
+        
 
+def get_free_space_mb(dirname):
+    """
+    Get the free space in MB in the directory path.
+    """
+    st = os.statvfs(dirname)
+    return st.f_bavail * st.f_frsize / 1024 / 1024
 
 def stop_telemetry_process():
     pids_filepath = os.path.join(os.getcwd(),'omstelemetry.pid')
@@ -317,6 +360,12 @@ def install():
     
     return exit_code, output
 
+def check_kill_process(pstring):
+    for line in os.popen("ps ax | grep " + pstring + " | grep -v grep"):
+        fields = line.split()
+        pid = fields[0]
+        os.kill(int(pid), signal.SIGKILL)
+
 def uninstall():
     """
     Uninstall the OMSAgent shell bundle.
@@ -332,16 +381,26 @@ def uninstall():
     hutil_log_info('Running command "{0}"'.format(cmd))
 
     # Retry, since uninstall can fail due to concurrent package operations
-    exit_code, output = run_command_with_retries_output(cmd, retries = 5,
-                                         retry_check = retry_if_dpkg_locked_or_curl_is_not_found,
-                                         final_check = final_check_if_dpkg_locked)
+    try:
+        exit_code, output = run_command_with_retries_output(cmd, retries = 5,
+                                            retry_check = retry_if_dpkg_locked_or_curl_is_not_found,
+                                            final_check = final_check_if_dpkg_locked)
+    except Exception as e:
+        # try to force clean the installation
+        try:
+            check_kill_process("omsagent")
+            exit_code = 0
+        except Exception as ex:
+            exit_code = 1
+            message = 'Uninstall failed with error: {0}\n' \
+                    'Stacktrace: {1}'.format(ex, traceback.format_exc())
+
     if IsUpgrade:
         IsUpgrade = False
     else:
         remove_workspace_configuration()
 
     return exit_code, output
-
 
 def enable():
     """
@@ -472,8 +531,16 @@ def enable():
                 hutil_log_info('Created extension marker file ' \
                                '{0}'.format(extension_marker_path))
             except IOError as e:
-                hutil_log_error('Error creating {0} with error: ' \
-                               '{1}'.format(extension_marker_path, e))
+                try:
+                    open(extension_marker_path, 'w+').close()
+                    hutil_log_info('Created extension marker file ' \
+                               '{0}'.format(extension_marker_path))
+                except IOError as ex:
+                    hutil_log_error('Error creating {0} with error: ' \
+                                '{1}'.format(extension_marker_path, ex))
+                    # we are having some kind of permissions issue creating the marker file
+                    output = "Couldn't create marker file"
+                    exit_code = 52 # since it is a missing dependency
 
         # Sleep to prevent bombarding the processes, then restart all processes
         # to resolve any issues with auto-started processes from --upgrade
@@ -974,7 +1041,26 @@ def run_command_and_log(cmd, check_error = True, log_cmd = True):
     # take only the last 100 characters as extension cuts off after that	
     try:	
         if exit_code is not 0:	
-            sys.stderr.write(output[-500:])        	
+            sys.stderr.write(output[-500:])        
+
+        if exit_code is 19:
+            if "rpmdb" in output or "libc6 is not installed" in output or "libpam-runtime is not installed" in output or "cannot open Packages database" in output or "exited with status 52" in output or "/bin/sh is needed" in output:
+                # OMI (19) happens to be the first package we install and if we get rpmdb failures, its a system issue
+                # 52 is the exit code for missing dependency i.e. rpmdb, libc6 or libpam-runtime
+                # https://github.com/Azure/azure-marketplace/wiki/Extension-Build-Notes-Best-Practices#error-codes-and-messages-output-to-stderr
+                exit_code = 52
+        if exit_code is 33:
+            if "Permission denied" in output:
+                # Enable failures
+                # 52 is the exit code for missing dependency i.e. rpmdb, libc6 or libpam-runtime
+                # https://github.com/Azure/azure-marketplace/wiki/Extension-Build-Notes-Best-Practices#error-codes-and-messages-output-to-stderr
+                exit_code = 52        
+        if exit_code is 5:
+            if "Reason: InvalidWorkspaceKey" in output or "Reason: MissingHeader" in output:
+                # Enable failures
+                # 53 is the exit code for configuration errors
+                # https://github.com/Azure/azure-marketplace/wiki/Extension-Build-Notes-Best-Practices#error-codes-and-messages-output-to-stderr
+                exit_code = 53        
     except:	
         hutil_log_info('Failed to write output to STDERR')	
   
